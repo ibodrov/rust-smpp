@@ -89,10 +89,8 @@ fn read_u32(r: &mut Iterator<Item=u8>) -> Result<u32, SmppError> {
 }
 
 fn write_u32(w: &mut Write, i: u32) -> std::io::Result<usize> {
-    let ab = [(i >> 24) as u8,
-              (i >> 16) as u8,
-              (i >> 8) as u8,
-              i as u8];
+    println!("write_u32: {}", i);
+    let ab = unsafe { std::mem::transmute::<u32, [u8; 4]>(i.to_be()) };
     w.write(&ab)
 }
 
@@ -147,9 +145,9 @@ fn write_pdu(msg: SmppMessage, w: &mut Write) -> std::io::Result<usize> {
     try!(write_u32(&mut buf, msg.command.to_id().unwrap()));
     try!(write_u32(&mut buf, msg.command_status));
     try!(write_u32(&mut buf, msg.sequence_number));
-    try!(buf.write("test".as_bytes()));
+    try!(buf.write(&vec![0u8]));
 
-    written = written + write_u32(w, buf.len() as u32).unwrap();
+    written = written + write_u32(w, (buf.len() + 4) as u32).unwrap();
     written = written + w.write(&buf).unwrap();
 
     Ok(written)
@@ -163,26 +161,27 @@ fn handle_client(mut conn: SmppConnection) {
     };
 
     let stream = &conn.stream;
-
-    let mut bytes = BufReader::new(stream).bytes()
-        .map(flatten);
-
+    let mut bytes = BufReader::new(stream).bytes().map(flatten);
     let mut writer = BufWriter::new(stream);
 
     loop {
         let pdu = read_pdu(&mut bytes).unwrap();
+        println!("<< got: {:?}", pdu);
+        
         match pdu.command {
             SmppCommand::BindTransceiver => {
                 let resp;
                 
                 match conn.status {
                     SmppConnectionStatus::NotYetBound => {
-                        resp = pdu.make_resp(0x00000005);
+                        // ESME_ROK
+                        resp = pdu.make_resp(0x00000000);
                         conn.status = SmppConnectionStatus::Bound;
+                        println!("bound!");
                     },
 
                     _ => {
-                        println!("handle_client warn: bind failed, connection was {:?}", conn.status);
+                        // ESME_RALYBND
                         resp = pdu.make_resp(0x00000005);
                     }
                 }
@@ -193,7 +192,6 @@ fn handle_client(mut conn: SmppConnection) {
 
             _ => println!("nothing to do")
         }
-        println!("<< got: {:?}", pdu);
     }
 }
 
