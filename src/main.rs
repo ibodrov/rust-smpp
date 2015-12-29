@@ -50,15 +50,27 @@ struct SmppMessage<'a> {
 }
 
 impl<'a> SmppMessage<'a> {
-    fn make_resp() -> SmppMessage<'a> {
+    fn make_resp(self: &SmppMessage<'a>, command_status: u32) -> SmppMessage<'a> {
         SmppMessage {
             command_length: 0,
             command: SmppCommand::BindTransceiverResp,
-            command_status: 0,
-            sequence_number: 0,
+            command_status: command_status,
+            sequence_number: self.sequence_number,
             headers: HashMap::new()
         }
     }
+}
+
+#[derive(Debug)]
+enum SmppConnectionStatus {
+    NotYetBound,
+    Bound
+}
+
+#[derive(Debug)]
+struct SmppConnection {
+    status: SmppConnectionStatus,
+    stream: TcpStream
 }
 
 fn read_u32(r: &mut Iterator<Item=u8>) -> Result<u32, SmppError> {
@@ -69,10 +81,10 @@ fn read_u32(r: &mut Iterator<Item=u8>) -> Result<u32, SmppError> {
             Some(i) => i,
             None => return Err(SmppError::EOF)
         };
-        
+
         out = out << 4 | v as u32;
     }
-    
+
     Ok(out)
 }
 
@@ -90,7 +102,7 @@ fn read_u8(r: &mut Iterator<Item=u8>) -> Result<u8, SmppError> {
         None => Err(SmppError::EOF)
     }
 }
-    
+
 fn read_cstring(r: &mut Iterator<Item=u8>) -> String {
     r.take_while(|&c| c != 0)
         .map(|c| c as char)
@@ -103,7 +115,7 @@ fn read_pdu(r: &mut Iterator<Item=u8>) -> Result<SmppMessage, SmppError> {
                        .ok_or(SmppError::UnsupportedCommandId));
     let command_status = try!(read_u32(r));
     let sequence_number = try!(read_u32(r));
-    
+
     let mut headers = HashMap::new();
     match command {
         SmppCommand::BindTransceiver => {
@@ -143,22 +155,38 @@ fn write_pdu(msg: SmppMessage, w: &mut Write) -> std::io::Result<usize> {
     Ok(written)
 }
 
-fn handle_client(stream: TcpStream) {
+fn handle_client(mut conn: SmppConnection) {
+    // Result<u8> -> u8
     let flatten = |b| match b {
         Ok(value) => value,
         Err(e) => panic!("handle_client error: {}", e)
     };
 
-    let mut bytes = BufReader::new(&stream).bytes()
+    let stream = &conn.stream;
+
+    let mut bytes = BufReader::new(stream).bytes()
         .map(flatten);
 
-    let mut writer = BufWriter::new(&stream);
-    
+    let mut writer = BufWriter::new(stream);
+
     loop {
         let pdu = read_pdu(&mut bytes).unwrap();
         match pdu.command {
             SmppCommand::BindTransceiver => {
-                let resp = SmppMessage::make_resp();
+                let resp;
+                
+                match conn.status {
+                    SmppConnectionStatus::NotYetBound => {
+                        resp = pdu.make_resp(0x00000005);
+                        conn.status = SmppConnectionStatus::Bound;
+                    },
+
+                    _ => {
+                        println!("handle_client warn: bind failed, connection was {:?}", conn.status);
+                        resp = pdu.make_resp(0x00000005);
+                    }
+                }
+                
                 write_pdu(resp, &mut writer).unwrap();
                 writer.flush().unwrap();
             }
@@ -175,8 +203,11 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let c = SmppConnection{ status: SmppConnectionStatus::NotYetBound,
+                                        stream: stream };
+                
                 thread::spawn(move || {
-                    handle_client(stream);
+                    handle_client(c);
                 });
             }
 
