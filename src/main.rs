@@ -4,10 +4,8 @@ use std::thread;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 
-mod pdu;
-
 #[derive(Debug)]
-enum SmppError {
+enum SmppCommandStatus {
     /// ESME_RINVMSGLEN
     InvalidMessageLength,
     
@@ -15,14 +13,16 @@ enum SmppError {
     InvalidCommandId
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug)]
 enum SmppCommand {
     SubmitSm,
     SubmitSmResp,
+    Unbind,
+    UnbindResp,
     BindTransceiver,
     BindTransceiverResp,
     EnquireLink,
-    EnquireLinkResp
+    EnquireLinkResp,
 }
 
 impl SmppCommand {
@@ -30,6 +30,8 @@ impl SmppCommand {
         match id {
             0x00000004 => Some(SmppCommand::SubmitSm),
             0x80000004 => Some(SmppCommand::SubmitSmResp),
+            0x00000006 => Some(SmppCommand::Unbind),
+            0x80000006 => Some(SmppCommand::UnbindResp),
             0x00000009 => Some(SmppCommand::BindTransceiver),
             0x80000009 => Some(SmppCommand::BindTransceiverResp),
             0x00000015 => Some(SmppCommand::EnquireLink),
@@ -38,10 +40,12 @@ impl SmppCommand {
         }
     }
 
-    fn to_id(self) -> u32 {
-        match self {
+    fn to_id(&self) -> u32 {
+        match *self {
             SmppCommand::SubmitSm => 0x00000004,
             SmppCommand::SubmitSmResp => 0x80000004,
+            SmppCommand::Unbind => 0x00000006,
+            SmppCommand::UnbindResp => 0x80000006,
             SmppCommand::BindTransceiver => 0x00000009,
             SmppCommand::BindTransceiverResp => 0x80000009,
             SmppCommand::EnquireLink => 0x00000015,
@@ -50,14 +54,14 @@ impl SmppCommand {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum HeaderValue {
     Str(String),
     Byte(u8),
     ByteArray(Vec<u8>)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SmppMessage<'a> {
     command_length: u32,
     command: SmppCommand,
@@ -68,11 +72,13 @@ struct SmppMessage<'a> {
 }
 
 impl<'a> SmppMessage<'a> {
-    fn make_resp(self: &SmppMessage<'a>, command_status: u32) -> Result<SmppMessage<'a>, SmppError> {
+    fn make_resp(&self, command_status: u32) -> Result<SmppMessage<'a>, SmppCommandStatus> {
         let command = match self.command {
             SmppCommand::BindTransceiver => SmppCommand::BindTransceiverResp,
             SmppCommand::EnquireLink => SmppCommand::EnquireLinkResp,
-            _ => return Err(SmppError::InvalidCommandId)
+            SmppCommand::SubmitSm => SmppCommand::SubmitSmResp,
+            SmppCommand::Unbind => SmppCommand::UnbindResp,
+            _ => return Err(SmppCommandStatus::InvalidCommandId)
         };
         
         Ok(SmppMessage {
@@ -84,14 +90,14 @@ impl<'a> SmppMessage<'a> {
         })
     }
 
-    fn get_str(self: &SmppMessage<'a>, k: &str) -> &String {
+    fn get_str(&self, k: &str) -> &String {
         match self.headers.get(k) {
             Some(&HeaderValue::Str(ref x)) => x,
             _ => panic!("get_str: missing value or invalid type") // TODO more details
         }
     }
 
-    fn set_str(self: &'a mut SmppMessage<'a>, k : &'a str, v: String) {
+    fn set_str(&mut self, k : &'a str, v: String) {
         self.headers.insert(k, HeaderValue::Str(v));
     }
 }
@@ -115,10 +121,10 @@ impl SmppConnection {
         }
     }
 
-    fn read_pdu(r: &mut Iterator<Item=u8>) -> Result<SmppMessage, SmppError> {
+    fn read_pdu(r: &mut Iterator<Item=u8>) -> Result<SmppMessage, SmppCommandStatus> {
         let command_length = try!(read_u32(r));
         let command = try!(SmppCommand::from_id(try!(read_u32(r)))
-                           .ok_or(SmppError::InvalidCommandId));
+                           .ok_or(SmppCommandStatus::InvalidCommandId));
         let command_status = try!(read_u32(r));
         let sequence_number = try!(read_u32(r));
         
@@ -160,8 +166,12 @@ impl SmppConnection {
                 headers.insert("sm_length", HeaderValue::Byte(sm_length));
                 headers.insert("short_message", HeaderValue::ByteArray(read_exact(r, sm_length as usize)));
             }
+
+            SmppCommand::Unbind => {
+                // NOOP
+            }
             
-            _ => return Err(SmppError::InvalidCommandId)
+            _ => return Err(SmppCommandStatus::InvalidCommandId)
         };
         
         Ok(SmppMessage {
@@ -205,6 +215,10 @@ impl SmppConnection {
                 }
             }
 
+            SmppCommand::UnbindResp => {
+                // NOOP
+            }
+
             _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "write_pdu: Unsupported command"))
         }
 
@@ -220,13 +234,13 @@ impl SmppConnection {
 }
 
 /// Reads an u32 value from the specified iterator.
-fn read_u32(r: &mut Iterator<Item=u8>) -> Result<u32, SmppError> {
+fn read_u32(r: &mut Iterator<Item=u8>) -> Result<u32, SmppCommandStatus> {
     let mut out = 0;
     
     for _ in 0..4 {
         let v = match r.next() {
             Some(i) => i,
-            None => return Err(SmppError::InvalidMessageLength)
+            None => return Err(SmppCommandStatus::InvalidMessageLength)
         };
 
         out = out << 4 | v as u32;
@@ -240,10 +254,10 @@ fn write_u32(w: &mut Write, i: u32) -> std::io::Result<usize> {
     w.write(&ab)
 }
 
-fn read_u8(r: &mut Iterator<Item=u8>) -> Result<u8, SmppError> {
+fn read_u8(r: &mut Iterator<Item=u8>) -> Result<u8, SmppCommandStatus> {
     match r.next() {
         Some(i) => Ok(i),
-        None => Err(SmppError::InvalidMessageLength)
+        None => Err(SmppCommandStatus::InvalidMessageLength)
     }
 }
 
@@ -303,18 +317,19 @@ fn handle_client(mut conn: SmppConnection) {
             }
 
             SmppCommand::SubmitSm => {
-                let resp = {
-                    /*
-                    let x = pdu.make_resp(0x00000000).unwrap();
-                    x.set_str("message_id", pdu.sequence_number.to_string());
-                    x
-                     */
-                    1
-                };
-
-                //SmppConnection::write_pdu(resp, &mut writer).unwrap();
+                let mut resp = pdu.make_resp(0x00000000).unwrap();
+                resp.set_str("message_id", pdu.sequence_number.to_string());
+                SmppConnection::write_pdu(resp, &mut writer).unwrap();
                 writer.flush().unwrap();
                 println!("submit_sm_resp!");
+            }
+
+            SmppCommand::Unbind => {
+                let resp = pdu.make_resp(0x00000000).unwrap();
+                SmppConnection::write_pdu(resp, &mut writer).unwrap();
+                writer.flush().unwrap();
+                println!("unbind_resp!");
+                return;
             }
 
             _ => println!("nothing to do")
